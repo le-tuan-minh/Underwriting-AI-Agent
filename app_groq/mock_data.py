@@ -1,56 +1,72 @@
-from app_groq.schemas import AgentAOutput, MatchedDocument
+from app_groq.schemas import AgentAOutput, ValidationResults, MatchedDocument
 
-# Mock input khớp chính xác với output format Agent A đã cập nhật
 MOCK_INPUT = AgentAOutput(
-    analysis=(
-        "Bộ hồ sơ của khách hàng có một số chứng từ phù hợp với yêu cầu "
-        "của checklist, nhưng vẫn còn thiếu một số giấy tờ quan trọng"
+    success=True,
+    loan_profile_type="Vay thế chấp bất động sản",
+    validation_results=ValidationResults(
+        analysis=(
+            "Danh sách hồ sơ của khách hàng đã được đối chiếu với Bộ Checklist sản phẩm chuẩn. "
+            "Kết quả cho thấy khách hàng đã cung cấp hầu hết các chứng từ cần thiết, "
+            "tuy nhiên vẫn còn một số chứng từ thiếu hoặc không hợp lệ."
+        ),
+        matched_documents=[
+            MatchedDocument(
+                checklist_id="cccd",
+                checklist_item="CCCD/Hộ chiếu của Khách hàng vay và người đồng trách nhiệm (nếu có)",
+                file_assigned="01_cccd_front.png",
+                actual_option_used=None,
+                sub_document_id=None,
+                group="1_Pháp lý nhân thân",
+                status="Valid",
+            ),
+            MatchedDocument(
+                checklist_id="cu_tru_vneid",
+                checklist_item="Thông tin cư trú tra cứu qua VNeID",
+                file_assigned="02_vneid_screenshot.png",
+                actual_option_used=None,
+                sub_document_id=None,
+                group="1_Pháp lý nhân thân",
+                status="Valid",
+            ),
+            MatchedDocument(
+                checklist_id="de_nghi_vay_von",
+                checklist_item="Giấy đề nghị vay vốn kiêm Phương án hiện thực hóa (Mẫu Ngân hàng)",
+                file_assigned="03_don_de_nghi_vay_von.pdf",
+                actual_option_used=None,
+                sub_document_id=None,
+                group="2_Phương án vay",
+                status="Valid",
+            ),
+            MatchedDocument(
+                checklist_id="dk_doanh_nghiep",
+                checklist_item="Giấy chứng nhận đăng ký doanh nghiệp (ĐKDN)",
+                file_assigned="04_giay_phep_dkkd.pdf",
+                actual_option_used="thu_nhap_doanh_nghiep",
+                sub_document_id="dk_doanh_nghiep",
+                group="3_Nguồn thu nhập",
+                status="Valid",
+            ),
+            MatchedDocument(
+                checklist_id="sao_ke_tk_cty",
+                checklist_item="Sao kê tài khoản thanh toán của Doanh nghiệp (tối thiểu 6 tháng gần nhất)",
+                file_assigned="06_sao_ke_tai_khoan.pdf",
+                actual_option_used="thu_nhap_doanh_nghiep",
+                sub_document_id="sao_ke_tk_cty",
+                group="3_Nguồn thu nhập",
+                status="Valid",
+            ),
+        ],
+        missing_mandatory_documents=[
+            "hd_dat_coc_nha",
+            "so_do_gcn_qsdđ",
+            "chung_thu_dinh_gia",
+            "bao_cao_de_xuat",
+        ],
+        missing_optional_documents=[
+            "tinh_trang_hon_nhan",
+            "hd_tin_dung_tctd",
+        ],
+        is_eligible_for_review=False,
     ),
-    matched_documents=[
-        MatchedDocument(
-            checklist_item="1.1_Chung_tu_nhan_than",
-            file_assigned="01_cccd_front.png",
-            status="Valid",
-        ),
-        MatchedDocument(
-            checklist_item="1.1_Chung_tu_nhan_than",
-            file_assigned="02_vneid_screenshot.png",
-            status="Valid",
-        ),
-        MatchedDocument(
-            checklist_item="1.2_Chung_tu_nguon_thu",
-            file_assigned="04_giay_phep_dkkd.pdf",
-            status="Valid",
-        ),
-        MatchedDocument(
-            checklist_item="1.2_Chung_tu_nguon_thu",
-            file_assigned="05_hoa_don_vat.png",
-            status="Valid",
-        ),
-        MatchedDocument(
-            checklist_item="1.2_Chung_tu_nguon_thu",
-            file_assigned="06_sao_ke_tai_khoan.pdf",
-            status="Valid",
-        ),
-        MatchedDocument(
-            checklist_item="1.4_Chung_tu_Phuong_an_vay",
-            file_assigned="03_don_de_nghi_vay_von.pdf",
-            status="Valid",
-        ),
-    ],
-    missing_documents=[
-        "Giay_dang_ky_ket_hon",
-        "Bao_cao_tai_chinh_BCTC",
-        "Giay_to_ton_tai_GCN_HDMB",
-        "Hop_dong_cho_thue",
-        "Chung_tu_nhan_tien_thue",
-        "Anh_cho_thue",
-        "Hop_dong_tin_dung_HDTD",
-        "Hop_dong_dat_coc_nha",
-        "GCN_QSDĐ",
-        "Giay_to_phap_ly_TSBD_GCN_QSDĐ",
-        "Chung_thu_dinh_gia",
-        "Bao_cao_de_xuat_cap_tin_dung",
-    ],
-    is_eligible_for_review=False,
+    error=None,
 )

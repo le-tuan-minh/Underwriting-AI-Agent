@@ -1,6 +1,6 @@
 import os
 import json
-from typing import TypedDict, List
+from typing import TypedDict, List, Dict
 from groq import Groq
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
@@ -8,28 +8,31 @@ from app_groq.schemas import AgentAOutput, AgentBOutput, MatchedDocument
 
 load_dotenv()
 
-# ── Groq client ───────────────────────────────────────────────────────────────
+# ── Groq client ────────────────────────────────────────────────────────────────
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 GROQ_MODEL              = "llama-3.3-70b-versatile"
-GROQ_INPUT_COST_PER_1M  = 0.59
-GROQ_OUTPUT_COST_PER_1M = 0.79
+GROQ_INPUT_COST_PER_1M  = 0.59   # USD per 1M input tokens
+GROQ_OUTPUT_COST_PER_1M = 0.79   # USD per 1M output tokens
 
 
 # ── GraphState ────────────────────────────────────────────────────────────────
 
 class GraphState(TypedDict):
     # Input từ Agent A
+    loan_profile_type: str
     analysis: str
     matched_documents: List[MatchedDocument]
-    missing_documents: List[str]
+    missing_mandatory_documents: List[str]
+    missing_optional_documents: List[str]
     is_eligible_for_review: bool
 
     # Trung gian — do các node tính toán
-    valid_docs: List[str]           # file_assigned của doc có status Valid
-    invalid_docs: List[str]         # file_assigned của doc có status Invalid
-    doc_stats: dict                 # tổng hợp số liệu hồ sơ
-    risk_level: str                 # "LOW" / "MEDIUM" / "HIGH"
+    valid_docs: List[str]
+    invalid_docs: List[str]
+    docs_by_group: Dict[str, List[str]]     # matched docs nhóm theo group
+    doc_stats: dict
+    risk_level: str                          # "LOW" / "MEDIUM" / "HIGH"
 
     # Raw output từ LLM
     llm_output: dict
@@ -37,7 +40,8 @@ class GraphState(TypedDict):
     # Output cuối
     overall_assessment: str
     warning_report: str
-    missing_documents_vi: List[str]
+    missing_mandatory_vi: List[str]
+    missing_optional_vi: List[str]
     matched_summary: List[str]
     recommendations: List[str]
 
@@ -51,10 +55,18 @@ def input_parser(state: GraphState) -> GraphState:
     valid_docs   = [d.file_assigned for d in state["matched_documents"] if d.status == "Valid"]
     invalid_docs = [d.file_assigned for d in state["matched_documents"] if d.status != "Valid"]
 
+    # Nhóm matched docs theo group
+    docs_by_group: Dict[str, List[str]] = {}
+    for d in state["matched_documents"]:
+        docs_by_group.setdefault(d.group, []).append(
+            f"{d.file_assigned} ({d.checklist_item})"
+        )
+
     return {
         **state,
-        "valid_docs":   valid_docs,
-        "invalid_docs": invalid_docs,
+        "valid_docs":    valid_docs,
+        "invalid_docs":  invalid_docs,
+        "docs_by_group": docs_by_group,
     }
 
 
@@ -63,50 +75,29 @@ def input_parser(state: GraphState) -> GraphState:
 # Tính thống kê hồ sơ và xác định mức độ rủi ro — không gọi LLM
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Mapping mã chứng từ → nhóm nghiệp vụ
-_DOC_GROUP_MAP = {
-    "Giay_dang_ky_ket_hon":            "Nhân thân",
-    "Bao_cao_tai_chinh_BCTC":          "Tài chính",
-    "Giay_to_ton_tai_GCN_HDMB":        "Tài sản bảo đảm",
-    "Hop_dong_cho_thue":               "Tài chính",
-    "Chung_tu_nhan_tien_thue":         "Tài chính",
-    "Anh_cho_thue":                    "Tài chính",
-    "Hop_dong_tin_dung_HDTD":          "Pháp lý tín dụng",
-    "Hop_dong_dat_coc_nha":            "Tài sản bảo đảm",
-    "GCN_QSDĐ":                        "Tài sản bảo đảm",
-    "Giay_to_phap_ly_TSBD_GCN_QSDĐ":  "Tài sản bảo đảm",
-    "Chung_thu_dinh_gia":              "Tài sản bảo đảm",
-    "Bao_cao_de_xuat_cap_tin_dung":    "Pháp lý tín dụng",
-}
-
 def document_analyzer(state: GraphState) -> GraphState:
-    total_matched  = len(state["matched_documents"])
-    total_valid    = len(state["valid_docs"])
-    total_invalid  = len(state["invalid_docs"])
-    total_missing  = len(state["missing_documents"])
-    total_required = total_matched + total_missing
+    total_matched   = len(state["matched_documents"])
+    total_valid     = len(state["valid_docs"])
+    total_invalid   = len(state["invalid_docs"])
+    total_mandatory_missing = len(state["missing_mandatory_documents"])
+    total_optional_missing  = len(state["missing_optional_documents"])
+    total_required  = total_valid + total_mandatory_missing
 
     completion_rate = round(total_valid / total_required * 100, 1) if total_required > 0 else 0.0
 
-    # Nhóm các chứng từ thiếu theo nghiệp vụ
-    missing_by_group: dict[str, list] = {}
-    for doc in state["missing_documents"]:
-        group = _DOC_GROUP_MAP.get(doc, "Khác")
-        missing_by_group.setdefault(group, []).append(doc)
-
     doc_stats = {
-        "total_matched":   total_matched,
-        "total_valid":     total_valid,
-        "total_invalid":   total_invalid,
-        "total_missing":   total_missing,
-        "completion_rate": completion_rate,
-        "missing_by_group": missing_by_group,
+        "total_matched":          total_matched,
+        "total_valid":            total_valid,
+        "total_invalid":          total_invalid,
+        "total_mandatory_missing": total_mandatory_missing,
+        "total_optional_missing":  total_optional_missing,
+        "completion_rate":        completion_rate,
     }
 
-    # Xác định mức rủi ro dựa trên tỷ lệ hoàn thiện và is_eligible
+    # Xác định mức rủi ro
     if not state["is_eligible_for_review"] or completion_rate < 50:
         risk_level = "HIGH"
-    elif completion_rate < 75 or total_invalid > 0:
+    elif completion_rate < 75 or total_invalid > 0 or total_mandatory_missing > 0:
         risk_level = "MEDIUM"
     else:
         risk_level = "LOW"
@@ -115,21 +106,22 @@ def document_analyzer(state: GraphState) -> GraphState:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — risk_assessor  ⚡ LLM call duy nhất
-# Gọi Groq để sinh warning_report, missing_documents_vi, recommendations
+# NODE 3 — risk_assessor  ⚡ LLM call duy nhất (Claude Sonnet)
+# Gọi Anthropic để sinh warning_report, missing docs (VI), recommendations
 # ══════════════════════════════════════════════════════════════════════════════
 
 def risk_assessor(state: GraphState) -> GraphState:
     stats    = state["doc_stats"]
     eligible = "ĐỦ điều kiện" if state["is_eligible_for_review"] else "CHƯA ĐỦ điều kiện"
 
-    # Chuẩn bị danh sách thiếu theo nhóm
-    missing_group_text = "\n".join(
-        f"  [{group}]: {', '.join(docs)}"
-        for group, docs in stats["missing_by_group"].items()
+    mandatory_missing_text = (
+        "\n".join(f"  - {d}" for d in state["missing_mandatory_documents"])
+        if state["missing_mandatory_documents"] else "  (Không có)"
     )
-
-    # Chứng từ invalid (nếu có)
+    optional_missing_text = (
+        "\n".join(f"  - {d}" for d in state["missing_optional_documents"])
+        if state["missing_optional_documents"] else "  (Không có)"
+    )
     invalid_text = (
         "\n".join(f"  - {f}" for f in state["invalid_docs"])
         if state["invalid_docs"] else "  (Không có)"
@@ -139,32 +131,39 @@ def risk_assessor(state: GraphState) -> GraphState:
 Bạn là chuyên gia thẩm định hồ sơ tín dụng tại một ngân hàng Việt Nam.
 
 THÔNG TIN HỒ SƠ:
+- Loại sản phẩm vay: {state["loan_profile_type"]}
 - Trạng thái: {eligible} thẩm định
 - Mức độ rủi ro: {state["risk_level"]}
-- Tỷ lệ hoàn thiện: {stats["completion_rate"]}%
-- Chứng từ hợp lệ: {stats["total_valid"]} | Không hợp lệ: {stats["total_invalid"]} | Còn thiếu: {stats["total_missing"]}
+- Tỷ lệ hoàn thiện (bắt buộc): {stats["completion_rate"]}%
+- Chứng từ hợp lệ: {stats["total_valid"]} | Không hợp lệ: {stats["total_invalid"]}
+- Còn thiếu bắt buộc: {stats["total_mandatory_missing"]} | Thiếu tùy chọn: {stats["total_optional_missing"]}
 
-NHẬN XÉT TỪ HỆ THỐNG TRƯỚC:
+NHẬN XÉT TỪ AGENT A:
 {state["analysis"]}
 
-CHỨNG TỪ CÒN THIẾU (theo nhóm):
-{missing_group_text}
+CHỨNG TỪ BẮT BUỘC CÒN THIẾU:
+{mandatory_missing_text}
+
+CHỨNG TỪ TÙY CHỌN CÒN THIẾU:
+{optional_missing_text}
 
 CHỨNG TỪ KHÔNG HỢP LỆ:
 {invalid_text}
 
 Trả về JSON theo đúng cấu trúc sau, KHÔNG thêm bất kỳ text nào ngoài JSON:
 {{
-    "overall_assessment": "Đánh giá tổng thể 2-3 câu về chất lượng hồ sơ",
+    "overall_assessment": "Đánh giá tổng thể 2-3 câu về chất lượng hồ sơ, đề cập loại sản phẩm vay",
     "warning_report": "Cảnh báo chi tiết: rủi ro pháp lý, rủi ro tín dụng, lý do chưa đủ điều kiện (nếu có)",
-    "missing_documents_vi": ["Tên tiếng Việt đầy đủ của từng chứng từ còn thiếu"],
-    "recommendations": ["Hành động cụ thể cán bộ thẩm định cần thực hiện"]
+    "missing_mandatory_vi": ["Tên tiếng Việt đầy đủ của từng chứng từ BẮT BUỘC còn thiếu"],
+    "missing_optional_vi": ["Tên tiếng Việt đầy đủ của từng chứng từ TÙY CHỌN còn thiếu"],
+    "recommendations": ["Hành động cụ thể cán bộ thẩm định cần thực hiện, ưu tiên chứng từ bắt buộc trước"]
 }}
 
 Lưu ý:
-- Dịch tên mã chứng từ sang tiếng Việt đầy đủ trong missing_documents_vi.
+- Dịch mã chứng từ (snake_case) sang tên tiếng Việt đầy đủ, đúng nghiệp vụ ngân hàng.
+- Phân biệt rõ chứng từ bắt buộc và tùy chọn trong recommendations.
 - Nếu risk_level = HIGH, warning_report phải nêu rõ lý do và hậu quả nếu tiếp tục thẩm định.
-- Recommendations phải cụ thể theo nghiệp vụ ngân hàng Việt Nam.
+- Recommendations phải cụ thể theo nghiệp vụ ngân hàng Việt Nam và loại sản phẩm vay.
 """
 
     response = client.chat.completions.create(
@@ -175,6 +174,7 @@ Lưu ý:
     )
 
     raw_text = response.choices[0].message.content.strip()
+    # Strip markdown fences nếu có
     if raw_text.startswith("```"):
         raw_text = raw_text.split("```")[1]
         if raw_text.startswith("json"):
@@ -184,9 +184,9 @@ Lưu ý:
     llm_output = json.loads(raw_text)
 
     # Log chi phí
-    usage         = response.usage
-    input_cost    = usage.prompt_tokens     * GROQ_INPUT_COST_PER_1M  / 1_000_000
-    output_cost   = usage.completion_tokens * GROQ_OUTPUT_COST_PER_1M / 1_000_000
+    usage       = response.usage
+    input_cost  = usage.prompt_tokens     * GROQ_INPUT_COST_PER_1M  / 1_000_000
+    output_cost = usage.completion_tokens * GROQ_OUTPUT_COST_PER_1M / 1_000_000
     print(f"[risk_assessor] Model: {GROQ_MODEL}")
     print(f"[risk_assessor] Tokens: {usage.prompt_tokens} in / {usage.completion_tokens} out")
     print(f"[risk_assessor] Chi phí: ${input_cost + output_cost:.6f} USD")
@@ -206,7 +206,8 @@ def report_generator(state: GraphState) -> GraphState:
         **state,
         "overall_assessment":  llm.get("overall_assessment", ""),
         "warning_report":      llm.get("warning_report", ""),
-        "missing_documents_vi": llm.get("missing_documents_vi", []),
+        "missing_mandatory_vi": llm.get("missing_mandatory_vi", []),
+        "missing_optional_vi":  llm.get("missing_optional_vi", []),
         "recommendations":     llm.get("recommendations", []),
     }
 
@@ -217,15 +218,13 @@ def report_generator(state: GraphState) -> GraphState:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def output_formatter(state: GraphState) -> GraphState:
-    matched_summary = [
-        f"{d.file_assigned} [{d.checklist_item}] - {'Hợp lệ' if d.status == 'Valid' else d.status}"
-        for d in state["matched_documents"]
-    ]
+    matched_summary = []
+    for group, items in state["docs_by_group"].items():
+        matched_summary.append(f"[{group}]")
+        for item in items:
+            matched_summary.append(f"  ✓ {item}")
 
-    return {
-        **state,
-        "matched_summary": matched_summary,
-    }
+    return {**state, "matched_summary": matched_summary}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -255,35 +254,43 @@ _agent_graph = _build_graph()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PUBLIC ENTRY POINT — gọi từ main.py (interface không đổi)
+# PUBLIC ENTRY POINT — gọi từ main.py
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_agent_b(input_data: AgentAOutput) -> AgentBOutput:
+    vr = input_data.validation_results
+
     initial_state: GraphState = {
-        "analysis":             input_data.analysis,
-        "matched_documents":    input_data.matched_documents,
-        "missing_documents":    input_data.missing_documents,
-        "is_eligible_for_review": input_data.is_eligible_for_review,
-        # Các field trung gian — sẽ được điền bởi các node
-        "valid_docs":           [],
-        "invalid_docs":         [],
-        "doc_stats":            {},
-        "risk_level":           "",
-        "llm_output":           {},
-        "overall_assessment":   "",
-        "warning_report":       "",
-        "missing_documents_vi": [],
-        "matched_summary":      [],
-        "recommendations":      [],
+        "loan_profile_type":           input_data.loan_profile_type,
+        "analysis":                    vr.analysis,
+        "matched_documents":           vr.matched_documents,
+        "missing_mandatory_documents": vr.missing_mandatory_documents,
+        "missing_optional_documents":  vr.missing_optional_documents,
+        "is_eligible_for_review":      vr.is_eligible_for_review,
+        # Các field trung gian
+        "valid_docs":          [],
+        "invalid_docs":        [],
+        "docs_by_group":       {},
+        "doc_stats":           {},
+        "risk_level":          "",
+        "llm_output":          {},
+        "overall_assessment":  "",
+        "warning_report":      "",
+        "missing_mandatory_vi": [],
+        "missing_optional_vi":  [],
+        "matched_summary":     [],
+        "recommendations":     [],
     }
 
     final_state = _agent_graph.invoke(initial_state)
 
     return AgentBOutput(
+        loan_profile_type=final_state["loan_profile_type"],
         is_eligible_for_review=final_state["is_eligible_for_review"],
         overall_assessment=final_state["overall_assessment"],
         warning_report=final_state["warning_report"],
-        missing_documents=final_state["missing_documents_vi"],
+        missing_mandatory_documents=final_state["missing_mandatory_vi"],
+        missing_optional_documents=final_state["missing_optional_vi"],
         matched_summary=final_state["matched_summary"],
         invalid_documents=final_state["invalid_docs"],
         recommendations=final_state["recommendations"],
