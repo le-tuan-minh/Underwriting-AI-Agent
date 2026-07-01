@@ -1,34 +1,28 @@
 import os
 import httpx
+import pydantic
 from app_groq.schemas import AgentAOutput
 
-# Đọc từ env, fallback về localhost
 AGENT_A_URL = os.getenv("AGENT_A_URL", "http://localhost:8000/api/v1/validate-profile")
-AGENT_A_TIMEOUT = float(os.getenv("AGENT_A_TIMEOUT", "120"))  # giây
+AGENT_A_TIMEOUT = float(os.getenv("AGENT_A_TIMEOUT", "120"))
 
 
 class AgentAError(Exception):
-    """Raised khi Agent A trả lỗi hoặc không kết nối được."""
+    """Lỗi tầng kết nối/giao tiếp với Agent A: không tới được, timeout, HTTP lỗi, sai schema."""
     pass
 
 
 def call_agent_a(folder_path: str) -> AgentAOutput:
     """
-    Gửi POST tới Agent A với folder_path,
-    parse response thành AgentAOutput và trả về.
-
-    Raises:
-        AgentAError — nếu không kết nối được hoặc Agent A báo lỗi
-        pydantic.ValidationError — nếu response không đúng schema
+    Gửi POST tới Agent A. Lưu ý: nếu Agent A trả success=False (lỗi NGHIỆP VỤ,
+    ví dụ không đọc được ảnh), hàm này KHÔNG raise mà trả nguyên AgentAOutput
+    (kèm error message) để Agent B tự xử lý và sinh report degrade tương ứng.
+    Chỉ raise AgentAError khi lỗi ở tầng KẾT NỐI/GIAO TIẾP.
     """
     payload = {"folder_path": folder_path}
 
     try:
-        response = httpx.post(
-            AGENT_A_URL,
-            json=payload,
-            timeout=AGENT_A_TIMEOUT,
-        )
+        response = httpx.post(AGENT_A_URL, json=payload, timeout=AGENT_A_TIMEOUT)
         response.raise_for_status()
     except httpx.ConnectError:
         raise AgentAError(
@@ -47,10 +41,7 @@ def call_agent_a(folder_path: str) -> AgentAOutput:
 
     raw = response.json()
 
-    # Kiểm tra flag success từ Agent A
-    if not raw.get("success", True):
-        raise AgentAError(
-            f"Agent A báo lỗi xử lý: {raw.get('error', 'Không rõ nguyên nhân')}"
-        )
-
-    return AgentAOutput(**raw)
+    try:
+        return AgentAOutput(**raw)
+    except pydantic.ValidationError as e:
+        raise AgentAError(f"Agent A trả về dữ liệu không đúng định dạng mong đợi: {e}")
