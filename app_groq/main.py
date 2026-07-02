@@ -19,7 +19,7 @@ app = FastAPI(
         "Nhận output từ Agent A, sinh report cảnh báo chất lượng, chứng từ thiếu, "
         "đề xuất hành động — có bước xác nhận (human-in-the-loop) trước khi chốt report."
     ),
-    version="4.0.0",
+    version="5.0.0",
 )
 
 
@@ -27,7 +27,7 @@ class FolderRequest(BaseModel):
     folder_path: str
 
 
-ResumeResponse = Union[PendingApprovalResponse, CompletedResponse]
+ResumeResponse  = Union[PendingApprovalResponse, CompletedResponse]
 AnalyzeResponse = Union[PendingApprovalResponse, CompletedResponse]
 
 
@@ -35,7 +35,7 @@ AnalyzeResponse = Union[PendingApprovalResponse, CompletedResponse]
 def root():
     return {
         "message": "Agent B đang chạy",
-        "version": "4.0.0",
+        "version": "5.0.0",
         "agent_a_url": os.getenv("AGENT_A_URL", "http://localhost:8000/api/v1/validate-profile"),
     }
 
@@ -57,8 +57,7 @@ def analyze_from_folder(request: FolderRequest):
 
 @app.post("/analyze", response_model=AnalyzeResponse, tags=["Agent B"])
 def analyze(input_data: AgentAOutput):
-    """Nhận trực tiếp AgentAOutput (server-to-server). Không raise lỗi khi
-    success=False nữa — Agent B tự sinh report degrade tương ứng."""
+    """Nhận trực tiếp AgentAOutput (server-to-server)."""
     try:
         return start_agent_b(input_data)
     except Exception as e:
@@ -67,6 +66,7 @@ def analyze(input_data: AgentAOutput):
 
 @app.post("/analyze/mock", response_model=AnalyzeResponse, tags=["Agent B"])
 def analyze_mock():
+    """Test Agent B với mock data — không cần Agent A."""
     try:
         return start_agent_b(MOCK_INPUT)
     except Exception as e:
@@ -79,9 +79,9 @@ def analyze_resume(thread_id: str, decision: ApprovalDecision):
     Xác nhận (approve) hoặc từ chối (reject) nội dung LLM sinh ra.
 
     Body ví dụ:
-    - Approve:  {"approve": true}
-    - Approve kèm sửa tay: {"approve": true, "edited_llm_output": {...}}
-    - Reject (LLM sinh lại):  {"approve": false, "feedback": "Ghi rõ hơn rủi ro pháp lý"}
+    - Approve:                     {"approve": true}
+    - Approve kèm sửa tay:         {"approve": true, "edited_llm_output": {...}}
+    - Reject (LLM sinh lại):       {"approve": false, "feedback": "Ghi rõ hơn rủi ro pháp lý"}
     """
     try:
         return resume_agent_b(thread_id, decision.model_dump())

@@ -17,16 +17,41 @@ class MatchedDocument(BaseModel):
 class ValidationResults(BaseModel):
     analysis: str
     matched_documents: List[MatchedDocument]
+    # Giờ là list tên tiếng Việt đầy đủ (string), không còn là list ID
     missing_mandatory_documents: List[str]
     missing_optional_documents: List[str]
     is_eligible_for_review: bool
 
 
+# ── Cross-check (mới từ Agent A v2) ──────────────────────────────────────────
+
+class FieldValue(BaseModel):
+    """Một giá trị của field trong một file cụ thể."""
+    file_name: str
+    document_id: str
+    value: str
+
+
+class ConflictItem(BaseModel):
+    """Một mâu thuẫn dữ liệu được phát hiện khi kiểm tra chéo."""
+    field_name: str
+    values: List[FieldValue]
+    majority_value: Optional[str] = None        # None nếu không có đa số
+    conflicting_files: List[str]
+    reason: str
+
+
+class CrossCheckResults(BaseModel):
+    is_consistent: bool
+    conflicts_found: List[ConflictItem] = []    # rỗng nếu không có mâu thuẫn
+
+
 class AgentAOutput(BaseModel):
     """Toàn bộ output mà Agent A gửi sang Agent B."""
     success: bool
-    loan_profile_type: Optional[str] = None          # có thể None nếu Agent A lỗi sớm
-    validation_results: Optional[ValidationResults] = None   # có thể None nếu lỗi
+    loan_profile_type: Optional[str] = None
+    validation_results: Optional[ValidationResults] = None
+    cross_check_results: Optional[CrossCheckResults] = None   # ← field mới
     error: Optional[str] = None
 
 
@@ -41,6 +66,8 @@ class AgentBOutput(BaseModel):
     missing_optional_documents: List[str]
     matched_summary: List[str]
     invalid_documents: List[str]
+    # Thêm phần cross-check vào output để hiển thị trên UI
+    cross_check_summary: List[str]
     recommendations: List[str]
 
 
@@ -49,8 +76,8 @@ class AgentBOutput(BaseModel):
 class ApprovalDecision(BaseModel):
     """Body gửi lên khi user xác nhận (approve/reject) nội dung LLM sinh ra."""
     approve: bool
-    edited_llm_output: Optional[Dict[str, Any]] = None   # nếu user sửa lại nội dung trước khi approve
-    feedback: Optional[str] = None                        # lý do nếu reject
+    edited_llm_output: Optional[Dict[str, Any]] = None
+    feedback: Optional[str] = None
 
 
 class PendingApprovalResponse(BaseModel):
@@ -62,7 +89,7 @@ class PendingApprovalResponse(BaseModel):
 
 
 class CompletedResponse(BaseModel):
-    """Trả về khi graph đã chạy xong (approve thành công hoặc lỗi Agent A)."""
+    """Trả về khi graph đã chạy xong."""
     status: str = "completed"
     result: AgentBOutput
 

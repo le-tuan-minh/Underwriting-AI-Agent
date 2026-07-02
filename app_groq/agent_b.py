@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
-from app_groq.schemas import AgentAOutput, AgentBOutput, MatchedDocument
+from app_groq.schemas import AgentAOutput, AgentBOutput, MatchedDocument, CrossCheckResults
 
 load_dotenv()
 
@@ -25,23 +25,26 @@ class GraphState(TypedDict):
     loan_profile_type: str
     analysis: str
     matched_documents: List[MatchedDocument]
+    # Giờ là list string tên đầy đủ tiếng Việt (không còn là list ID)
     missing_mandatory_documents: List[str]
     missing_optional_documents: List[str]
     is_eligible_for_review: bool
+    # Cross-check từ Agent A v2
+    cross_check_results: Optional[CrossCheckResults]
 
     valid_docs: List[str]
     invalid_docs: List[str]
     docs_by_group: Dict[str, List[str]]
     doc_stats: dict
     risk_level: str
+    cross_check_summary: List[str]      # ← mới: dòng mô tả từng conflict
 
     llm_output: dict
-    human_feedback: Optional[dict]     # lưu quyết định approve/reject gần nhất
+    human_feedback: Optional[dict]
 
     overall_assessment: str
     warning_report: str
-    missing_mandatory_vi: List[str]
-    missing_optional_vi: List[str]
+    # Không cần _vi suffix nữa vì missing docs đã là tiếng Việt đầy đủ từ Agent A
     matched_summary: List[str]
     recommendations: List[str]
 
@@ -58,7 +61,29 @@ def input_parser(state: GraphState) -> GraphState:
     for d in state["matched_documents"]:
         docs_by_group.setdefault(d.group, []).append(f"{d.file_assigned} ({d.checklist_item})")
 
-    return {**state, "valid_docs": valid_docs, "invalid_docs": invalid_docs, "docs_by_group": docs_by_group}
+    # Format cross-check thành list dòng mô tả
+    cross_check_summary: List[str] = []
+    ccr = state.get("cross_check_results")
+    if ccr and not ccr.is_consistent and ccr.conflicts_found:
+        for conflict in ccr.conflicts_found:
+            # Ví dụ: "⚠ Ngày sinh: cccd.jpg='15/02/1990' vs Don_vay.pdf='15/10/1988'"
+            value_str = " | ".join(
+                f"{v.file_name}='{v.value}'" for v in conflict.values
+            )
+            line = f"⚠ {conflict.field_name}: {value_str} — {conflict.reason}"
+            if conflict.majority_value:
+                line += f" (đa số: '{conflict.majority_value}', file sai: {', '.join(conflict.conflicting_files)})"
+            cross_check_summary.append(line)
+    elif ccr and ccr.is_consistent:
+        cross_check_summary.append("✓ Tất cả thông tin giữa các chứng từ đều nhất quán.")
+
+    return {
+        **state,
+        "valid_docs": valid_docs,
+        "invalid_docs": invalid_docs,
+        "docs_by_group": docs_by_group,
+        "cross_check_summary": cross_check_summary,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -66,14 +91,21 @@ def input_parser(state: GraphState) -> GraphState:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def document_analyzer(state: GraphState) -> GraphState:
-    total_matched   = len(state["matched_documents"])
-    total_valid     = len(state["valid_docs"])
-    total_invalid   = len(state["invalid_docs"])
+    total_valid             = len(state["valid_docs"])
+    total_invalid           = len(state["invalid_docs"])
     total_mandatory_missing = len(state["missing_mandatory_documents"])
     total_optional_missing  = len(state["missing_optional_documents"])
-    total_required  = total_valid + total_mandatory_missing
+    total_matched           = len(state["matched_documents"])
+    total_required          = total_valid + total_mandatory_missing
 
     completion_rate = round(total_valid / total_required * 100, 1) if total_required > 0 else 0.0
+
+    # Tính thêm: có mâu thuẫn dữ liệu không?
+    has_conflicts = bool(
+        state.get("cross_check_results")
+        and not state["cross_check_results"].is_consistent
+        and state["cross_check_results"].conflicts_found
+    )
 
     doc_stats = {
         "total_matched": total_matched,
@@ -82,11 +114,15 @@ def document_analyzer(state: GraphState) -> GraphState:
         "total_mandatory_missing": total_mandatory_missing,
         "total_optional_missing": total_optional_missing,
         "completion_rate": completion_rate,
+        "has_conflicts": has_conflicts,
+        "conflict_count": len(state["cross_check_results"].conflicts_found)
+            if has_conflicts else 0,
     }
 
+    # Mâu thuẫn dữ liệu giữa các chứng từ → tăng mức rủi ro
     if not state["is_eligible_for_review"] or completion_rate < 50:
         risk_level = "HIGH"
-    elif completion_rate < 75 or total_invalid > 0 or total_mandatory_missing > 0:
+    elif completion_rate < 75 or total_invalid > 0 or total_mandatory_missing > 0 or has_conflicts:
         risk_level = "MEDIUM"
     else:
         risk_level = "LOW"
@@ -102,12 +138,13 @@ def risk_assessor(state: GraphState) -> GraphState:
     stats    = state["doc_stats"]
     eligible = "ĐỦ điều kiện" if state["is_eligible_for_review"] else "CHƯA ĐỦ điều kiện"
 
+    # missing_mandatory_documents giờ đã là tên đầy đủ tiếng Việt → dùng trực tiếp
     mandatory_missing_text = (
-        "\n".join(f"  - {d}" for d in state["missing_mandatory_documents"])
+        "\n".join(f"  - {name}" for name in state["missing_mandatory_documents"])
         if state["missing_mandatory_documents"] else "  (Không có)"
     )
     optional_missing_text = (
-        "\n".join(f"  - {d}" for d in state["missing_optional_documents"])
+        "\n".join(f"  - {name}" for name in state["missing_optional_documents"])
         if state["missing_optional_documents"] else "  (Không có)"
     )
     invalid_text = (
@@ -115,13 +152,25 @@ def risk_assessor(state: GraphState) -> GraphState:
         if state["invalid_docs"] else "  (Không có)"
     )
 
-    # Nếu đang được resume sau khi bị REJECT, đưa feedback của user vào prompt
-    # để LLM sinh lại nội dung tốt hơn.
+    # Phần cross-check đưa vào prompt để LLM nhận biết và cảnh báo
+    conflict_count = stats.get("conflict_count", 0)
+    if conflict_count > 0:
+        cross_check_text = (
+            f"PHÁT HIỆN {conflict_count} MÂU THUẪN DỮ LIỆU GIỮA CÁC CHỨNG TỪ:\n"
+            + "\n".join(f"  {line}" for line in state["cross_check_summary"])
+        )
+    else:
+        cross_check_text = "Không phát hiện mâu thuẫn dữ liệu giữa các chứng từ."
+
+    # Feedback từ lần reject trước (nếu có)
     feedback_text = ""
     if state.get("human_feedback") and not state["human_feedback"].get("approve", True):
         fb = state["human_feedback"].get("feedback")
         if fb:
-            feedback_text = f"\n\nLƯU Ý: Lần trước cán bộ thẩm định đã từ chối bản nháp với góp ý sau, hãy điều chỉnh cho phù hợp:\n{fb}\n"
+            feedback_text = (
+                f"\n\nLƯU Ý: Lần trước cán bộ thẩm định đã từ chối bản nháp với góp ý sau, "
+                f"hãy điều chỉnh cho phù hợp:\n{fb}\n"
+            )
 
     prompt = f"""
 Bạn là chuyên gia thẩm định hồ sơ tín dụng tại một ngân hàng Việt Nam.
@@ -145,21 +194,27 @@ CHỨNG TỪ TÙY CHỌN CÒN THIẾU:
 
 CHỨNG TỪ KHÔNG HỢP LỆ:
 {invalid_text}
+
+KIỂM TRA CHÉO THÔNG TIN GIỮA CÁC CHỨNG TỪ:
+{cross_check_text}
 {feedback_text}
 Trả về JSON theo đúng cấu trúc sau, KHÔNG thêm bất kỳ text nào ngoài JSON:
 {{
-    "overall_assessment": "Đánh giá tổng thể 2-3 câu về chất lượng hồ sơ, đề cập loại sản phẩm vay",
-    "warning_report": "Cảnh báo chi tiết: rủi ro pháp lý, rủi ro tín dụng, lý do chưa đủ điều kiện (nếu có)",
-    "missing_mandatory_vi": ["Tên tiếng Việt đầy đủ của từng chứng từ BẮT BUỘC còn thiếu"],
-    "missing_optional_vi": ["Tên tiếng Việt đầy đủ của từng chứng từ TÙY CHỌN còn thiếu"],
-    "recommendations": ["Hành động cụ thể cán bộ thẩm định cần thực hiện, ưu tiên chứng từ bắt buộc trước"]
+    "overall_assessment": "Đánh giá tổng thể 2-3 câu về chất lượng hồ sơ. Nếu có mâu thuẫn dữ liệu, phải đề cập.",
+    "warning_report": "Cảnh báo chi tiết: rủi ro pháp lý, rủi ro tín dụng, mâu thuẫn thông tin (nếu có), lý do chưa đủ điều kiện.",
+    "recommendations": [
+        "Hành động cụ thể ưu tiên #1 (ưu tiên chứng từ bắt buộc và mâu thuẫn dữ liệu trước)",
+        "Hành động cụ thể ưu tiên #2",
+        "..."
+    ]
 }}
 
 Lưu ý:
-- Dịch mã chứng từ (snake_case) sang tên tiếng Việt đầy đủ, đúng nghiệp vụ ngân hàng.
-- Phân biệt rõ chứng từ bắt buộc và tùy chọn trong recommendations.
+- Chứng từ bắt buộc/tùy chọn đã được cung cấp tên tiếng Việt đầy đủ — KHÔNG cần dịch lại, dùng nguyên.
+- Nếu có mâu thuẫn dữ liệu (cross-check), warning_report PHẢI nêu từng mâu thuẫn và yêu cầu xác minh.
 - Nếu risk_level = HIGH, warning_report phải nêu rõ lý do và hậu quả nếu tiếp tục thẩm định.
 - Recommendations phải cụ thể theo nghiệp vụ ngân hàng Việt Nam và loại sản phẩm vay.
+- Ưu tiên xử lý mâu thuẫn dữ liệu trước khi bổ sung chứng từ, vì mâu thuẫn có thể là dấu hiệu gian lận.
 """
 
     response = client.chat.completions.create(
@@ -190,7 +245,6 @@ Lưu ý:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 3.5 — human_approval  🧍 HUMAN-IN-THE-LOOP (interrupt)
-# Dừng graph, chờ cán bộ thẩm định xác nhận/sửa nội dung LLM sinh ra
 # ══════════════════════════════════════════════════════════════════════════════
 
 def human_approval(state: GraphState) -> GraphState:
@@ -202,19 +256,17 @@ def human_approval(state: GraphState) -> GraphState:
         ),
         "llm_output": state["llm_output"],
         "risk_level": state["risk_level"],
+        # Đưa cả cross_check_summary vào để UI hiển thị khi chờ duyệt
+        "cross_check_summary": state["cross_check_summary"],
     })
 
-    # decision là dict được gửi lên từ endpoint resume, dạng ApprovalDecision
     if decision.get("edited_llm_output"):
-        # User tự sửa tay nội dung -> dùng luôn bản đã sửa
         return {**state, "llm_output": decision["edited_llm_output"], "human_feedback": decision}
 
     return {**state, "human_feedback": decision}
 
 
 def _route_after_approval(state: GraphState) -> str:
-    """Nếu user reject (và không sửa tay) -> quay lại risk_assessor sinh lại bản mới.
-    Nếu approve (hoặc reject nhưng đã tự sửa tay) -> đi tiếp report_generator."""
     fb = state.get("human_feedback") or {}
     if fb.get("approve") is False and not fb.get("edited_llm_output"):
         return "risk_assessor"
@@ -230,10 +282,8 @@ def report_generator(state: GraphState) -> GraphState:
     return {
         **state,
         "overall_assessment": llm.get("overall_assessment", ""),
-        "warning_report": llm.get("warning_report", ""),
-        "missing_mandatory_vi": llm.get("missing_mandatory_vi", []),
-        "missing_optional_vi": llm.get("missing_optional_vi", []),
-        "recommendations": llm.get("recommendations", []),
+        "warning_report":     llm.get("warning_report", ""),
+        "recommendations":    llm.get("recommendations", []),
     }
 
 
@@ -251,7 +301,7 @@ def output_formatter(state: GraphState) -> GraphState:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BUILD GRAPH — thêm node human_approval + checkpointer (MemorySaver)
+# BUILD GRAPH
 # ══════════════════════════════════════════════════════════════════════════════
 
 _memory_saver = MemorySaver()
@@ -279,7 +329,6 @@ def _build_graph():
     graph.add_edge("report_generator", "output_formatter")
     graph.add_edge("output_formatter", END)
 
-    # checkpointer bắt buộc phải có để interrupt() hoạt động (lưu state giữa các lần gọi API)
     return graph.compile(checkpointer=_memory_saver)
 
 
@@ -296,20 +345,18 @@ def _state_to_output(final_state: dict) -> AgentBOutput:
         is_eligible_for_review=final_state["is_eligible_for_review"],
         overall_assessment=final_state["overall_assessment"],
         warning_report=final_state["warning_report"],
-        missing_mandatory_documents=final_state["missing_mandatory_vi"],
-        missing_optional_documents=final_state["missing_optional_vi"],
+        # Dùng trực tiếp từ Agent A — không qua LLM dịch nữa
+        missing_mandatory_documents=final_state["missing_mandatory_documents"],
+        missing_optional_documents=final_state["missing_optional_documents"],
         matched_summary=final_state["matched_summary"],
         invalid_documents=final_state["invalid_docs"],
+        cross_check_summary=final_state["cross_check_summary"],
         recommendations=final_state["recommendations"],
     )
 
 
 def _build_agent_a_failure_report(input_data: AgentAOutput) -> AgentBOutput:
-    """Sinh report chuẩn khi Agent A không xử lý được hồ sơ
-    (success=False hoặc thiếu validation_results). Trường hợp này KHÔNG
-    cần qua human_approval vì không có nội dung LLM nào cần duyệt."""
     reason = input_data.error or "Không rõ nguyên nhân (Agent A không trả về chi tiết lỗi)."
-
     return AgentBOutput(
         loan_profile_type=input_data.loan_profile_type or "Không xác định",
         is_eligible_for_review=False,
@@ -325,6 +372,7 @@ def _build_agent_a_failure_report(input_data: AgentAOutput) -> AgentBOutput:
         missing_optional_documents=[],
         matched_summary=[],
         invalid_documents=[],
+        cross_check_summary=[],
         recommendations=[
             "Yêu cầu kiểm tra lại chất lượng file ảnh, PDF đã tải lên.",
             "Thử chạy lại thẩm định sau khi khắc phục.",
@@ -334,17 +382,10 @@ def _build_agent_a_failure_report(input_data: AgentAOutput) -> AgentBOutput:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PUBLIC ENTRY POINTS — gọi từ main.py
+# PUBLIC ENTRY POINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def start_agent_b(input_data: AgentAOutput, thread_id: Optional[str] = None) -> dict:
-    """
-    Bắt đầu 1 phiên chạy Agent B mới.
-    Trả về dict:
-      {"status": "completed", "result": AgentBOutput}          — khi Agent A lỗi (bỏ qua approval)
-      {"status": "pending_approval", "thread_id": ..., "llm_output": ...}  — khi cần user duyệt
-    """
-    # Guard: Agent A báo lỗi hoặc thiếu dữ liệu -> trả report degrade ngay, không cần approve
     if not input_data.success or input_data.validation_results is None:
         return {"status": "completed", "result": _build_agent_a_failure_report(input_data)}
 
@@ -356,14 +397,14 @@ def start_agent_b(input_data: AgentAOutput, thread_id: Optional[str] = None) -> 
         "loan_profile_type":           input_data.loan_profile_type,
         "analysis":                    vr.analysis,
         "matched_documents":           vr.matched_documents,
-        "missing_mandatory_documents": vr.missing_mandatory_documents,
+        "missing_mandatory_documents": vr.missing_mandatory_documents,   # list[str] tên đầy đủ
         "missing_optional_documents":  vr.missing_optional_documents,
         "is_eligible_for_review":      vr.is_eligible_for_review,
+        "cross_check_results":         input_data.cross_check_results,   # ← mới
         "valid_docs": [], "invalid_docs": [], "docs_by_group": {},
-        "doc_stats": {}, "risk_level": "",
+        "doc_stats": {}, "risk_level": "", "cross_check_summary": [],
         "llm_output": {}, "human_feedback": None,
         "overall_assessment": "", "warning_report": "",
-        "missing_mandatory_vi": [], "missing_optional_vi": [],
         "matched_summary": [], "recommendations": [],
     }
 
@@ -375,27 +416,24 @@ def start_agent_b(input_data: AgentAOutput, thread_id: Optional[str] = None) -> 
             "status": "pending_approval",
             "thread_id": thread_id,
             "llm_output": interrupt_payload["llm_output"],
+            # Trả cross_check_summary về UI để hiển thị cạnh form duyệt
+            "cross_check_summary": interrupt_payload.get("cross_check_summary", []),
         }
 
     return {"status": "completed", "result": _state_to_output(result_state)}
 
 
 def resume_agent_b(thread_id: str, decision: dict) -> dict:
-    """
-    Resume phiên đang chờ approve.
-    decision: {"approve": bool, "edited_llm_output": Optional[dict], "feedback": Optional[str]}
-    """
     config = {"configurable": {"thread_id": thread_id}}
-
     result_state = _agent_graph.invoke(Command(resume=decision), config=config)
 
     if "__interrupt__" in result_state:
-        # Trường hợp reject -> risk_assessor chạy lại -> lại dừng ở human_approval lần nữa
         interrupt_payload = result_state["__interrupt__"][0].value
         return {
             "status": "pending_approval",
             "thread_id": thread_id,
             "llm_output": interrupt_payload["llm_output"],
+            "cross_check_summary": interrupt_payload.get("cross_check_summary", []),
         }
 
     return {"status": "completed", "result": _state_to_output(result_state)}
